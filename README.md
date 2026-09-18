@@ -6,7 +6,7 @@
 - **幂等写入**：每个 `event_id` 只生效一次；相同载荷重放返回原结果（200），相同 `event_id` 不同载荷返回 **409**。
 - **原子批量写入**：`POST /events/batch` 一次接收 1～100 个事件，在同一 `BEGIN IMMEDIATE` 事务中校验并落库，按数组顺序分配一段连续 revision；任一事件非法整批回滚，不留事件、不耗 revision。
 - **更正链**：更正事件通过 `correction_of` 引用已有事件（或同批更早的事件），更正本身可被再次更正（链式）。任一 revision 上，每条更正链只计**当时的末端事件**。
-- **递增 revision**：每次成功写入获得严格递增的 revision；可查询当前或任一历史 revision 的排行榜与生效明细。
+- **递增 revision**：每次成功写入获得严格递增的 revision；可查询当前或任一历史 revision 的排行榜与生效明细，也可对比两个 revision 之间的名次变化（`/leaderboard/changes`）与生效事件变化（`/events/changes`）。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入（含批量）不会产生重复 revision 或中间态。
 
 ## 快速启动
@@ -247,7 +247,75 @@ curl 'localhost:8000/leaderboard/changes?from_revision=0&to_revision=4'
 |---|---|---|
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/events` | 全部事件（按 revision 升序） |
+| `GET` | `/events/changes` | 两个 revision 之间的**生效事件**变化（按更正链根分组），见下 |
 | `GET` | `/events/{event_id}` | 单个事件 |
+
+### 生效事件变化 `GET /events/changes`
+
+比较两个 revision 快照之间**生效事件集合**的变化。生效规则与排行榜完全一致（revision R 上事件存在且未被同样存在于 R 的更正事件取代），并沿 `correction_of` 链把每个生效事件追溯到其**链根**（`correction_of` 为空的事件 ID）。两个查询参数均**必填**：
+
+| 查询参数 | 说明 |
+|---|---|
+| `from_revision` | 起点 revision，允许传 `0` 表示空快照；须满足 `0 ≤ from_revision` |
+| `to_revision` | 终点 revision，须满足 `from_revision < to_revision ≤ 当前 revision` |
+
+每个链根下，先把两个快照中 `event_id` 相同的生效事件互相**抵消**；剩余项按下列规则归类：
+
+- 恰好**一进一出**（after 侧 1 个、before 侧 1 个）：合并为一条 `replaced`（`before` → `after`）；
+- after 侧多出的事件分别记为 `added`（`before: null`）；
+- before 侧多出的事件分别记为 `removed`（`after: null`）。
+
+因此，更正链末端在窗口内推进时，链根下只产生一条 `replaced`；若窗口一端为空快照（如 `from_revision=0`），则整条链只表现为末端事件的 `added`。不同链根的一进一出**不会**合并；同一事件被多条更正分叉时（同链根下一进多出），分别记为一条 `removed` 与多条 `added`。
+
+每条变化携带：
+
+| 字段 | 说明 |
+|---|---|
+| `change_type` | `added` / `removed` / `replaced` |
+| `chain_root_id` | 更正链根事件的 `event_id` |
+| `before` | 起点快照中的**完整事件**（与 `GET /events/{id}` 同结构）；`added` 时为 `null` |
+| `after` | 终点快照中的**完整事件**；`removed` 时为 `null` |
+
+结果按 `(chain_root_id, 锚点 revision, 锚点 event_id)` 升序排列，锚点优先取 `after`，`after` 为空（`removed`）时取 `before`。
+
+- 参数非法（缺参/非整数/负数、`from_revision ≥ to_revision`）返回 `422`；
+- `to_revision` 超出当前 revision 返回 `404`（顺序校验优先于范围校验）。
+
+```bash
+# e1(alice,10)、e2(bob,5) 已存在；rev 3 写入 e3(carol,12) 更正 e1
+curl 'localhost:8000/events/changes?from_revision=2&to_revision=3'
+```
+
+```json
+{
+  "from_revision": 2,
+  "to_revision": 3,
+  "changes": [
+    {
+      "change_type": "replaced",
+      "chain_root_id": "e1",
+      "before": {
+        "event_id": "e1",
+        "participant_id": "alice",
+        "points": 10,
+        "correction_of": null,
+        "revision": 1,
+        "created_at": "2026-09-17T08:00:00.000Z"
+      },
+      "after": {
+        "event_id": "e3",
+        "participant_id": "carol",
+        "points": 12,
+        "correction_of": "e1",
+        "revision": 3,
+        "created_at": "2026-09-17T08:02:00.000Z"
+      }
+    }
+  ]
+}
+```
+
+`e2` 在两个快照中都生效，已被抵消；`e3` 的链根是被更正的 `e1`，故只有一条挂在 `chain_root_id: "e1"` 下的 `replaced`。
 
 ## 配置
 
@@ -273,7 +341,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），以及 `/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空快照新增、窗口内单步/多跳链末端合并为 `replaced`、相同 event_id 抵消、不同链根不合并、同链分叉一进多出分别 added/removed、链根追溯、完整 before/after 事件、按链根与锚点 revision/event_id 排序、路由不遮蔽 `/events/{event_id}`、缺参/非整数/负数/同序 422、超当前 404），以及 `/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续）。
 
 ## 设计要点
 

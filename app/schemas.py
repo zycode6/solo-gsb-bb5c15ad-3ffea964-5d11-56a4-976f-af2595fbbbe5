@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, RootModel, model_validator
 
@@ -100,3 +100,30 @@ class LeaderboardChangesOut(BaseModel):
     from_revision: int
     to_revision: int
     changes: List[LeaderboardChangeOut]
+
+
+class EventChangeOut(BaseModel):
+    """One effective-event change between two revisions within a chain root."""
+
+    change_type: Literal["added", "removed", "replaced"] = Field(
+        description=(
+            "added: effective only at to_revision; removed: effective only "
+            "at from_revision; replaced: exactly one in/out pair under the "
+            "same chain root, before -> after."
+        )
+    )
+    chain_root_id: str = Field(
+        description="event_id at the root of the correction chain (correction_of == null)."
+    )
+    before: Optional[EventOut] = Field(
+        default=None, description="Full event effective at from_revision; null for added."
+    )
+    after: Optional[EventOut] = Field(
+        default=None, description="Full event effective at to_revision; null for removed."
+    )
+
+
+class EventChangesOut(BaseModel):
+    from_revision: int
+    to_revision: int
+    changes: List[EventChangeOut]

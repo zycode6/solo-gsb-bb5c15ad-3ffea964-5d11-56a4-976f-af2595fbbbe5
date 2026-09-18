@@ -15,6 +15,8 @@ from .db import read_tx, write_tx
 from .schemas import (
     EffectiveEvent,
     EventBatchIn,
+    EventChangeOut,
+    EventChangesOut,
     EventIn,
     EventOut,
     LeaderboardChangeOut,
@@ -416,6 +418,157 @@ def leaderboard_changes(
                 )
             )
     return LeaderboardChangesOut(
+        from_revision=from_revision,
+        to_revision=to_revision,
+        changes=changes,
+    )
+
+
+def _effective_event_rows(conn: sqlite3.Connection, revision: int) -> list[sqlite3.Row]:
+    """Full rows effective at ``revision`` (same rule as ``_effective_rows``)."""
+    return conn.execute(
+        """
+        SELECT e.event_id, e.participant_id, e.points, e.revision,
+               e.correction_of, e.created_at
+        FROM events e
+        WHERE e.revision <= ?
+          AND NOT EXISTS (
+                SELECT 1 FROM events c
+                WHERE c.correction_of = e.event_id
+                  AND c.revision <= ?
+          )
+        """,
+        (revision, revision),
+    ).fetchall()
+
+
+def _chain_root_map(conn: sqlite3.Connection, revision: int) -> dict[str, str]:
+    """``{event_id: chain_root_id}`` for every event existing at ``revision``.
+
+    The chain root is the ancestor reached by repeatedly following
+    ``correction_of`` (which always points to an earlier revision) until an
+    event with ``correction_of IS NULL``. Results are memoized, so each
+    chain is walked at most once.
+    """
+    parent = {
+        row["event_id"]: row["correction_of"]
+        for row in conn.execute(
+            "SELECT event_id, correction_of FROM events WHERE revision <= ?",
+            (revision,),
+        ).fetchall()
+    }
+    roots: dict[str, str] = {}
+    for start in parent:
+        if start in roots:
+            continue
+        path: list[str] = []
+        cur = start
+        while cur not in roots:
+            path.append(cur)
+            nxt = parent.get(cur)
+            if nxt is None:  # cur is the root of this walk
+                root_id = cur
+                break
+            cur = nxt
+        else:
+            root_id = roots[cur]
+        for node in path:
+            roots[node] = root_id
+    return roots
+
+
+def events_changes(from_revision: int, to_revision: int) -> EventChangesOut:
+    """Effective-event diffs between two revisions, grouped by chain root.
+
+    The effective event at each snapshot is computed with the same rule as
+    ``/leaderboard`` (an event counts iff it exists at that revision and no
+    correction existing there supersedes it), and every effective event is
+    traced to the root of its correction chain.
+
+    Per chain root the two sets of effective events are compared:
+      * an ``event_id`` present in both snapshots cancels out (no change);
+      * with exactly one remaining event on each side, the pair merges into
+        a single ``replaced`` entry (before -> after);
+      * every remaining after-only event is ``added`` and every
+        before-only event is ``removed``.
+
+    Validation order matches ``/leaderboard/changes``: ordering errors
+    (negative, ``from >= to``) are 422; ``to_revision`` beyond the current
+    maximum is 404. ``from_revision == 0`` denotes the empty snapshot.
+    """
+    if from_revision < 0 or from_revision >= to_revision:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "require 0 <= from_revision < to_revision, got "
+                f"from_revision={from_revision}, to_revision={to_revision}"
+            ),
+        )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if to_revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {to_revision} not found"
+            )
+        before_rows = _effective_event_rows(conn, from_revision)
+        after_rows = _effective_event_rows(conn, to_revision)
+        # Both snapshots' events exist at to_revision, so the map computed
+        # there resolves roots for every before/after event.
+        roots = _chain_root_map(conn, to_revision)
+
+    by_root: dict[str, dict[str, dict[str, EventOut]]] = {}
+    for rows, side in ((before_rows, "before"), (after_rows, "after")):
+        for row in rows:
+            groups = by_root.setdefault(roots[row["event_id"]], {"before": {}, "after": {}})
+            groups[side][row["event_id"]] = _row_to_event(row)
+
+    changes: list[EventChangeOut] = []
+    for chain_root_id, groups in by_root.items():
+        before = groups["before"]
+        after = groups["after"]
+        # Same effective event in both snapshots: cancel first.
+        for event_id in set(before) & set(after):
+            del before[event_id]
+            del after[event_id]
+        if len(before) == 1 and len(after) == 1:
+            (before_event,) = before.values()
+            (after_event,) = after.values()
+            changes.append(
+                EventChangeOut(
+                    change_type="replaced",
+                    chain_root_id=chain_root_id,
+                    before=before_event,
+                    after=after_event,
+                )
+            )
+            continue
+        for event in after.values():
+            changes.append(
+                EventChangeOut(
+                    change_type="added",
+                    chain_root_id=chain_root_id,
+                    after=event,
+                )
+            )
+        for event in before.values():
+            changes.append(
+                EventChangeOut(
+                    change_type="removed",
+                    chain_root_id=chain_root_id,
+                    before=event,
+                )
+            )
+
+    # chain root, then the revision/event_id of after (falling back to before).
+    def sort_key(change: EventChangeOut) -> Tuple[str, int, str]:
+        anchor = change.after if change.after is not None else change.before
+        return (change.chain_root_id, anchor.revision, anchor.event_id)
+
+    changes.sort(key=sort_key)
+    return EventChangesOut(
         from_revision=from_revision,
         to_revision=to_revision,
         changes=changes,

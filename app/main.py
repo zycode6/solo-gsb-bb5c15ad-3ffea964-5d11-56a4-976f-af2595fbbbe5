@@ -9,6 +9,7 @@ from . import ledger
 from .db import init_db
 from .schemas import (
     EventBatchIn,
+    EventChangesOut,
     EventIn,
     EventOut,
     LeaderboardChangesOut,
@@ -92,6 +93,27 @@ def post_events_batch(batch: EventBatchIn, response: Response) -> List[EventOut]
 @app.get("/events", response_model=List[EventOut])
 def get_events() -> List[EventOut]:
     return ledger.list_events()
+
+
+@app.get(
+    "/events/changes",
+    response_model=EventChangesOut,
+    responses={
+        404: {"description": "to_revision beyond the current maximum"},
+        422: {"description": "Missing/non-integer params, or invalid revision ordering"},
+    },
+)
+def get_events_changes(
+    from_revision: int = Query(
+        description="Earlier revision; 0 means the empty snapshot.",
+        ge=0,
+    ),
+    to_revision: int = Query(
+        description="Later revision; must be greater than from_revision.",
+        ge=0,
+    ),
+) -> EventChangesOut:
+    return ledger.events_changes(from_revision, to_revision)
 
 
 @app.get("/events/{event_id}", response_model=EventOut)
