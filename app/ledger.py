@@ -15,6 +15,8 @@ from .db import read_tx, write_tx
 from .schemas import (
     EffectiveEvent,
     EventBatchIn,
+    EventChangeOut,
+    EventChangesOut,
     EventIn,
     EventOut,
     LeaderboardChangeOut,
@@ -416,6 +418,114 @@ def leaderboard_changes(
                 )
             )
     return LeaderboardChangesOut(
+        from_revision=from_revision,
+        to_revision=to_revision,
+        changes=changes,
+    )
+
+
+def _event_snapshot(
+    conn: sqlite3.Connection, revision: int
+) -> dict[str, dict[str, EventOut]]:
+    """Effective events at ``revision``, grouped as ``{chain_root: {event_id: event}}``.
+
+    The effective rule matches ``/leaderboard``: at revision R an event counts
+    iff it exists at R and no correction existing at R supersedes it. The chain
+    root is found by walking ``correction_of`` links up to the uncorrected
+    ancestor; targets always exist and carry smaller revisions, so the walk
+    stays inside the snapshot and terminates.
+    """
+    if revision == 0:
+        return {}
+    rows = conn.execute(
+        "SELECT * FROM events WHERE revision <= ? ORDER BY revision ASC",
+        (revision,),
+    ).fetchall()
+    parents = {r["event_id"]: r["correction_of"] for r in rows}
+    superseded = {p for p in parents.values() if p is not None}
+
+    def root_of(event_id: str) -> str:
+        while parents[event_id] is not None:
+            event_id = parents[event_id]
+        return event_id
+
+    snapshot: dict[str, dict[str, EventOut]] = {}
+    for r in rows:
+        if r["event_id"] in superseded:
+            continue
+        snapshot.setdefault(root_of(r["event_id"]), {})[r["event_id"]] = (
+            _row_to_event(r)
+        )
+    return snapshot
+
+
+def event_changes(from_revision: int, to_revision: int) -> EventChangesOut:
+    """Effective-event differences between two revisions, grouped by chain root.
+
+    Within each correction chain, event_ids effective at both snapshots cancel
+    out. A chain left with exactly one outgoing and one incoming event yields a
+    single ``replaced`` change; any other remainder is reported as individual
+    ``added``/``removed`` changes. Validation order matches
+    ``/leaderboard/changes``: ordering errors are 422, revisions beyond the
+    current maximum are 404. ``from_revision == 0`` compares against the empty
+    ledger.
+    """
+    if from_revision < 0 or from_revision >= to_revision:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "require 0 <= from_revision < to_revision, got "
+                f"from_revision={from_revision}, to_revision={to_revision}"
+            ),
+        )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if to_revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {to_revision} not found"
+            )
+        before_map = _event_snapshot(conn, from_revision)
+        after_map = _event_snapshot(conn, to_revision)
+
+    changes: list[EventChangeOut] = []
+    for root in set(before_map) | set(after_map):
+        before_group = before_map.get(root, {})
+        after_group = after_map.get(root, {})
+        removed = [ev for eid, ev in before_group.items() if eid not in after_group]
+        added = [ev for eid, ev in after_group.items() if eid not in before_group]
+        if len(removed) == 1 and len(added) == 1:
+            changes.append(
+                EventChangeOut(
+                    chain_root=root,
+                    change_type="replaced",
+                    before=removed[0],
+                    after=added[0],
+                )
+            )
+        else:
+            changes.extend(
+                EventChangeOut(
+                    chain_root=root, change_type="removed", before=ev, after=None
+                )
+                for ev in removed
+            )
+            changes.extend(
+                EventChangeOut(
+                    chain_root=root, change_type="added", before=None, after=ev
+                )
+                for ev in added
+            )
+    changes.sort(
+        key=lambda c: (
+            c.chain_root,
+            (c.after or c.before).revision,
+            (c.after or c.before).event_id,
+        )
+    )
+    return EventChangesOut(
         from_revision=from_revision,
         to_revision=to_revision,
         changes=changes,
